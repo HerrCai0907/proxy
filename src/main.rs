@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::io::ErrorKind;
+use std::sync::{Arc, Mutex};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+mod recorder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -73,15 +75,44 @@ async fn forward_streams(
 ) -> io::Result<()> {
     let (mut client_reader, mut client_writer) = client_stream.split();
     let (mut target_reader, mut target_writer) = target_stream.split();
-    let client_to_target = async {
-        io::copy(&mut client_reader, &mut target_writer).await?;
+
+    let client_to_server_recorder = Arc::new(Mutex::new(recorder::Recorder::new()));
+    let mut client_to_server_recorder_writer = recorder::RecorderWriter {
+        recorder: client_to_server_recorder.clone(),
+    };
+    let mut client_to_server_recorder_reader =
+        recorder::RecorderReader::new(client_to_server_recorder.clone());
+
+    let server_to_client_recorder = Arc::new(Mutex::new(recorder::Recorder::new()));
+    let mut server_to_client_recorder_writer = recorder::RecorderWriter {
+        recorder: server_to_client_recorder.clone(),
+    };
+    let mut server_to_client_recorder_reader =
+        recorder::RecorderReader::new(server_to_client_recorder.clone());
+
+    let client_to_proxy = async {
+        io::copy(&mut client_reader, &mut client_to_server_recorder_writer).await?;
         Ok::<(), io::Error>(())
     };
-    let target_to_client = async {
-        io::copy(&mut target_reader, &mut client_writer).await?;
+    let proxy_to_target = async {
+        io::copy(&mut client_to_server_recorder_reader, &mut target_writer).await?;
         Ok::<(), io::Error>(())
     };
-    tokio::try_join!(client_to_target, target_to_client)?;
+
+    let target_to_proxy = async {
+        io::copy(&mut target_reader, &mut server_to_client_recorder_writer).await?;
+        Ok::<(), io::Error>(())
+    };
+    let proxy_to_client = async {
+        io::copy(&mut server_to_client_recorder_reader, &mut client_writer).await?;
+        Ok::<(), io::Error>(())
+    };
+    tokio::try_join!(
+        client_to_proxy,
+        proxy_to_target,
+        target_to_proxy,
+        proxy_to_client
+    )?;
     Ok(())
 }
 
